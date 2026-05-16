@@ -1,0 +1,15 @@
+node_modules
+.next
+.env
+.env.local
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+
+# user-uploaded files (leave receipts, etc.)
+/public/uploads/
+
+system-facts.md
+docs/
+.claude/
+CLAUDE.md

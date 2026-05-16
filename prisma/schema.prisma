@@ -1,0 +1,279 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  HR_OFFICER
+  PAYROLL_OFFICER
+  EMPLOYEE
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  HALF_DAY
+  ON_LEAVE
+  HOLIDAY
+}
+
+enum LeaveType {
+  CASUAL
+  SICK
+  EARNED
+  UNPAID
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum PayrollStatus {
+  DRAFT
+  PROCESSED
+  PAID
+}
+
+enum PayslipStatus {
+  DRAFT
+  VALIDATED
+  CANCELLED
+}
+
+model User {
+  id           String  @id @default(cuid())
+  loginId      String? @unique
+  email        String  @unique
+  passwordHash String
+  fullName     String
+  role         Role    @default(EMPLOYEE)
+  isActive     Boolean @default(true)
+
+  passwordChangedAt DateTime?
+
+  companyName String?
+  phone       String?
+
+  employeeCode String?   @unique
+  department   String?
+  designation  String?
+  managerName  String?
+  joinDate     DateTime?
+  joinYear     Int?
+  joinSerial   Int?
+  address      String?
+
+  // Resume tab
+  about    String?
+  jobLove  String?
+  hobbies  String?
+
+  // Private info tab
+  dob            DateTime?
+  nationality    String?
+  personalEmail  String?
+  gender         String?
+  maritalStatus  String?
+  accountNumber  String?
+  bankName       String?
+  ifscCode       String?
+  panNumber      String?
+  uanNumber      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salaryStructures SalaryStructure[]
+  attendances      Attendance[]
+  leaveAllocations LeaveAllocation[]
+  leaveRequests    LeaveRequest[]    @relation("LeaveApplicant")
+  approvedLeaves   LeaveRequest[]    @relation("LeaveApprover")
+  payslips         Payslip[]
+
+  @@index([role])
+  @@index([isActive])
+}
+
+model LoginIdCounter {
+  year       Int @id
+  lastSerial Int @default(0)
+}
+
+/// Reusable salary-structure preset. Admin curates these once; the New
+/// Employee dialog instantiates a per-employee SalaryStructure row from
+/// the chosen preset. Editing a template doesn't retroactively change
+/// existing employees — their SalaryStructure rows are independent
+/// snapshots.
+model SalaryStructureTemplate {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+
+  basicPercent             Float @default(0.50)
+  hraPercent               Float @default(0.50)
+  standardAllowancePercent Float @default(0.1667)
+  performanceBonusPercent  Float @default(0.0833)
+  ltaPercent               Float @default(0.0833)
+  pfEmployeePercent        Float @default(0.12)
+  pfEmployerPercent        Float @default(0.12)
+  professionalTax          Int   @default(20000) // paise
+  workingDaysPerWeek       Int   @default(6)
+  breakTimeHours           Float @default(1.0)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  createdById String?
+}
+
+model SalaryStructure {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ctcAnnual    String    // encrypted (AES-256-GCM); see lib/crypto/payroll.ts
+  basicPercent Float     @default(0.50)
+  hraPercent   Float     @default(0.50)
+  standardAllowancePercent Float @default(0.1667)
+  performanceBonusPercent  Float @default(0.0833)
+  ltaPercent               Float @default(0.0833)
+  pfEmployeePercent        Float @default(0.12)
+  pfEmployerPercent        Float @default(0.12)
+  professionalTax          Int   @default(20000) // paise — ₹200/month
+  workingDaysPerWeek       Int   @default(6)
+  breakTimeHours           Float @default(1.0)
+  effectiveFrom DateTime @default(now())
+  effectiveTo   DateTime?
+  createdAt    DateTime  @default(now())
+  createdById  String?
+
+  @@index([userId, effectiveFrom])
+}
+
+model Attendance {
+  id         String           @id @default(cuid())
+  userId     String
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date       DateTime         @db.Date
+  status     AttendanceStatus
+  checkInAt  DateTime?
+  checkOutAt DateTime?
+  notes      String?
+  markedAt   DateTime         @default(now())
+
+  @@unique([userId, date])
+  @@index([date])
+  @@index([userId, date])
+}
+
+model LeaveAllocation {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  leaveType     LeaveType
+  totalDays     Float
+  year          Int
+  allocatedById String?
+  createdAt     DateTime  @default(now())
+
+  @@unique([userId, leaveType, year])
+}
+
+model LeaveRequest {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation("LeaveApplicant", fields: [userId], references: [id], onDelete: Cascade)
+  leaveType LeaveType
+  startDate DateTime    @db.Date
+  endDate   DateTime    @db.Date
+  totalDays Float
+  reason    String
+  status    LeaveStatus @default(PENDING)
+
+  approvedById    String?
+  approvedBy      User?     @relation("LeaveApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt      DateTime?
+  rejectionReason String?
+
+  // Mandatory for SICK leave; optional otherwise. URL is served from /public.
+  receiptUrl  String?
+  receiptName String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([startDate, endDate])
+}
+
+model PayRun {
+  id                String        @id @default(cuid())
+  month             Int
+  year              Int
+  status            PayrollStatus @default(DRAFT)
+  totalGross        Int           @default(0)
+  totalNet          Int           @default(0)
+  totalDeductions   Int           @default(0)
+  totalEmployerCost Int           @default(0)
+  processedAt       DateTime?
+  processedById     String?
+  createdAt         DateTime      @default(now())
+
+  payslips Payslip[]
+
+  @@unique([month, year])
+}
+
+model Payslip {
+  id        String @id @default(cuid())
+  payRunId  String
+  payRun    PayRun @relation(fields: [payRunId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // All money fields below are encrypted (AES-256-GCM). See
+  // lib/crypto/payroll.ts and docs/payroll-encryption.md.
+  ctcAnnual String
+
+  basic            String
+  hra              String
+  specialAllowance String
+  grossEarned      String
+
+  employeePf      String
+  professionalTax String
+  totalDeductions String
+
+  netPay     String
+  employerPf String
+
+  totalWorkingDays Int
+  daysPresent      Float
+  daysOnLeave      Float
+  daysAbsent       Float
+  daysPayable      Float
+
+  status              PayslipStatus @default(DRAFT)
+  validatedAt         DateTime?
+  validatedById       String?
+  cancelledAt         DateTime?
+  cancelledById       String?
+  cancellationReason  String?
+
+  generatedAt DateTime @default(now())
+
+  @@unique([payRunId, userId])
+  @@index([userId])
+}
+
+model Holiday {
+  id   String   @id @default(cuid())
+  date DateTime @db.Date @unique
+  name String
+}
