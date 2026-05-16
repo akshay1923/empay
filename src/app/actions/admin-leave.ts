@@ -9,6 +9,7 @@ import { prisma } from "@/lib/prisma";
 import { LeaveStatus, LeaveType } from "@prisma/client";
 import { requirePermission } from "@/lib/auth/permissions";
 import { sendLeaveDecisionEmail } from "@/lib/mailer";
+import { checkLeaveBalance } from "@/lib/leaves/balance";
 
 const LEAVE_TYPE_LABEL: Record<LeaveType, string> = {
   CASUAL: "Casual leave",
@@ -90,35 +91,17 @@ export async function decideLeave(input: unknown) {
     }
 
     // APPROVE — balance check first (skip for UNPAID).
-    if (leave.leaveType !== "UNPAID") {
-      const year = leave.startDate.getFullYear();
-      const allocation = await prisma.leaveAllocation.findUnique({
-        where: {
-          userId_leaveType_year: {
-            userId: leave.userId,
-            leaveType: leave.leaveType,
-            year,
-          },
-        },
-      });
-      const taken = await prisma.leaveRequest.aggregate({
-        where: {
-          userId: leave.userId,
-          leaveType: leave.leaveType,
-          status: "APPROVED",
-          startDate: { gte: new Date(year, 0, 1) },
-          endDate: { lt: new Date(year + 1, 0, 1) },
-        },
-        _sum: { totalDays: true },
-      });
-      const available =
-        (allocation?.totalDays ?? 0) - (taken._sum.totalDays ?? 0);
-      if (available < leave.totalDays) {
-        return {
-          success: false as const,
-          error: `Insufficient ${leave.leaveType} balance. Available ${available}, requested ${leave.totalDays}.`,
-        };
-      }
+    const balance = await checkLeaveBalance(prisma, {
+      userId: leave.userId,
+      leaveType: leave.leaveType,
+      startDate: leave.startDate,
+      requestedDays: leave.totalDays,
+    });
+    if (!balance.ok) {
+      return {
+        success: false as const,
+        error: balance.error,
+      };
     }
 
     await prisma.leaveRequest.update({
@@ -207,6 +190,21 @@ export async function createLeaveOnBehalf(input: unknown) {
         success: false as const,
         error: "Selected range covers only Sundays",
       };
+    }
+
+    if (data.autoApprove) {
+      const balance = await checkLeaveBalance(prisma, {
+        userId: data.userId,
+        leaveType: data.leaveType as LeaveType,
+        startDate: start,
+        requestedDays: totalDays,
+      });
+      if (!balance.ok) {
+        return {
+          success: false as const,
+          error: balance.error,
+        };
+      }
     }
 
     await prisma.leaveRequest.create({
