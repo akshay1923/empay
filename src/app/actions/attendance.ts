@@ -6,6 +6,10 @@ import { revalidatePath } from "next/cache";
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { AttendanceStatus } from "@prisma/client";
+import {
+  grantCompOffIfWeekendWork,
+  revokeUnredeemedCompOff,
+} from "@/lib/compoff";
 
 const markSchema = z.object({
   status: z.enum(["PRESENT", "ABSENT", "HALF_DAY"]),
@@ -45,6 +49,22 @@ export async function markAttendance(input: unknown) {
         notes: data.notes,
       },
     });
+
+    // Comp-off trigger: working a Sunday or holiday earns a credit;
+    // flipping back to ABSENT revokes any un-redeemed credit.
+    if (data.status === "ABSENT") {
+      await revokeUnredeemedCompOff(prisma, session.user.id, today, {
+        revokedById: session.user.id,
+        reason: "Attendance flipped to ABSENT",
+      });
+    } else {
+      await grantCompOffIfWeekendWork(
+        prisma,
+        session.user.id,
+        today,
+        data.status,
+      );
+    }
 
     revalidatePath("/employee/dashboard");
     revalidatePath("/employee/attendance");

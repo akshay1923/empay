@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
+import { grantCompOffIfWeekendWork } from "@/lib/compoff";
 
 const LOCAL_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -45,6 +46,10 @@ export async function checkIn(localDate?: string) {
       checkInAt: now,
     },
   });
+
+  // Same trigger as the explicit "mark attendance" flow — a Sunday/holiday
+  // check-in earns a comp-off credit.
+  await grantCompOffIfWeekendWork(prisma, session.user.id, date, "PRESENT");
 
   revalidatePath("/", "layout");
   return { success: true as const };

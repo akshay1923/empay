@@ -27,6 +27,7 @@ enum LeaveType {
   SICK
   EARNED
   UNPAID
+  COMP_OFF
 }
 
 enum LeaveStatus {
@@ -97,6 +98,9 @@ model User {
   leaveRequests    LeaveRequest[]    @relation("LeaveApplicant")
   approvedLeaves   LeaveRequest[]    @relation("LeaveApprover")
   payslips         Payslip[]
+  compOffCredits     CompOffCredit[] @relation("CompOffOwner")
+  compOffGrants      CompOffCredit[] @relation("CompOffGrantedBy")
+  compOffRevocations CompOffCredit[] @relation("CompOffRevokedBy")
 
   @@index([role])
   @@index([isActive])
@@ -205,6 +209,10 @@ model LeaveRequest {
   receiptUrl  String?
   receiptName String?
 
+  // For COMP_OFF requests: the credits this request consumed (FIFO, set at
+  // approval time inside the same transaction that flips status -> APPROVED).
+  compOffCredits CompOffCredit[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -276,4 +284,44 @@ model Holiday {
   id   String   @id @default(cuid())
   date DateTime @db.Date @unique
   name String
+}
+
+/// Comp-off credit earned by working a Sunday or declared Holiday. One row
+/// per (user, day) — the unique constraint makes the auto-grant idempotent
+/// against repeated attendance toggles on the same date.
+///
+/// Lifecycle:
+///   - granted (redeemedById == null, revokedAt == null): available
+///   - redeemed (redeemedById != null): consumed by an approved leave
+///   - revoked (revokedAt != null): never redeemed, killed by attendance
+///     flip back to ABSENT or manual HR revoke
+model CompOffCredit {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation("CompOffOwner", fields: [userId], references: [id], onDelete: Cascade)
+  earnedOn       DateTime @db.Date
+  earnedFraction Float    @default(1.0) // 1.0 for PRESENT, 0.5 for HALF_DAY
+  expiresOn      DateTime @db.Date
+
+  // Audit: who granted it. null for attendance-trigger auto-grants.
+  grantedById String?
+  grantedBy   User?   @relation("CompOffGrantedBy", fields: [grantedById], references: [id], onDelete: SetNull)
+
+  // Redemption — set inside decideLeave() inside a transaction.
+  redeemedById     String?
+  redeemedBy       LeaveRequest? @relation(fields: [redeemedById], references: [id], onDelete: SetNull)
+  redeemedAt       DateTime?
+  redeemedFraction Float         @default(0)
+
+  // Revocation audit.
+  revokedAt        DateTime?
+  revokedById      String?
+  revokedBy        User?         @relation("CompOffRevokedBy", fields: [revokedById], references: [id], onDelete: SetNull)
+  revocationReason String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, earnedOn])
+  @@index([userId, expiresOn])
+  @@index([userId, redeemedById])
 }
