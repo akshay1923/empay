@@ -9,12 +9,14 @@ import { prisma } from "@/lib/prisma";
 import { LeaveStatus, LeaveType } from "@prisma/client";
 import { requirePermission } from "@/lib/auth/permissions";
 import { sendLeaveDecisionEmail } from "@/lib/mailer";
+import { listAvailableCredits, pickFifoCredits } from "@/lib/compoff";
 
 const LEAVE_TYPE_LABEL: Record<LeaveType, string> = {
   CASUAL: "Casual leave",
   SICK: "Sick leave",
   EARNED: "Earned leave",
   UNPAID: "Unpaid leave",
+  COMP_OFF: "Comp-off leave",
 };
 
 function countLeaveDays(start: Date, end: Date): number {
@@ -89,46 +91,103 @@ export async function decideLeave(input: unknown) {
       return { success: true as const };
     }
 
-    // APPROVE — balance check first (skip for UNPAID).
-    if (leave.leaveType !== "UNPAID") {
-      const year = leave.startDate.getFullYear();
-      const allocation = await prisma.leaveAllocation.findUnique({
-        where: {
-          userId_leaveType_year: {
-            userId: leave.userId,
-            leaveType: leave.leaveType,
-            year,
-          },
-        },
-      });
-      const taken = await prisma.leaveRequest.aggregate({
-        where: {
-          userId: leave.userId,
-          leaveType: leave.leaveType,
-          status: "APPROVED",
-          startDate: { gte: new Date(year, 0, 1) },
-          endDate: { lt: new Date(year + 1, 0, 1) },
-        },
-        _sum: { totalDays: true },
-      });
-      const available =
-        (allocation?.totalDays ?? 0) - (taken._sum.totalDays ?? 0);
-      if (available < leave.totalDays) {
+    // APPROVE — balance check first (skip for UNPAID). For COMP_OFF the
+    // balance check + credit consumption happens inside a single
+    // transaction so two concurrent approvers can't both consume the
+    // same credit row.
+    if (leave.leaveType === "COMP_OFF") {
+      try {
+        await prisma.$transaction(async (tx) => {
+          const candidates = await listAvailableCredits(
+            tx,
+            leave.userId,
+            leave.startDate
+          );
+          const pick = pickFifoCredits(
+            candidates,
+            leave.totalDays,
+            leave.startDate
+          );
+          if (!pick.ok) {
+            throw new Error(
+              `Insufficient comp-off credits. Need ${leave.totalDays}, have ${pick.available}. Short by ${pick.shortfall}.`
+            );
+          }
+          // Mark each consumed credit as redeemed. We split the consumed
+          // fraction across picked credits in the order they were chosen.
+          let remaining = pick.consumedFraction;
+          for (const c of pick.picked) {
+            const consume = Math.min(c.earnedFraction, remaining);
+            await tx.compOffCredit.update({
+              where: { id: c.id },
+              data: {
+                redeemedById: leave.id,
+                redeemedAt: new Date(),
+                redeemedFraction: consume,
+              },
+            });
+            remaining -= consume;
+            if (remaining <= 1e-9) break;
+          }
+          await tx.leaveRequest.update({
+            where: { id: data.leaveId },
+            data: {
+              status: LeaveStatus.APPROVED,
+              approvedById: session.user.id,
+              approvedAt: new Date(),
+            },
+          });
+        });
+      } catch (txErr) {
         return {
           success: false as const,
-          error: `Insufficient ${leave.leaveType} balance. Available ${available}, requested ${leave.totalDays}.`,
+          error:
+            txErr instanceof Error
+              ? txErr.message
+              : "Could not approve comp-off leave",
         };
       }
-    }
+    } else {
+      if (leave.leaveType !== "UNPAID") {
+        const year = leave.startDate.getFullYear();
+        const allocation = await prisma.leaveAllocation.findUnique({
+          where: {
+            userId_leaveType_year: {
+              userId: leave.userId,
+              leaveType: leave.leaveType,
+              year,
+            },
+          },
+        });
+        const taken = await prisma.leaveRequest.aggregate({
+          where: {
+            userId: leave.userId,
+            leaveType: leave.leaveType,
+            status: "APPROVED",
+            startDate: { gte: new Date(year, 0, 1) },
+            endDate: { lt: new Date(year + 1, 0, 1) },
+          },
+          _sum: { totalDays: true },
+        });
+        const available =
+          (allocation?.totalDays ?? 0) - (taken._sum.totalDays ?? 0);
+        if (available < leave.totalDays) {
+          return {
+            success: false as const,
+            error: `Insufficient ${leave.leaveType} balance. Available ${available}, requested ${leave.totalDays}.`,
+          };
+        }
+      }
 
-    await prisma.leaveRequest.update({
-      where: { id: data.leaveId },
-      data: {
-        status: LeaveStatus.APPROVED,
-        approvedById: session.user.id,
-        approvedAt: new Date(),
-      },
-    });
+      await prisma.leaveRequest.update({
+        where: { id: data.leaveId },
+        data: {
+          status: LeaveStatus.APPROVED,
+          approvedById: session.user.id,
+          approvedAt: new Date(),
+        },
+      });
+    }
     revalidatePath("/admin/timeoff");
     revalidatePath("/hr/leaves");
     after(async () => {
@@ -162,7 +221,7 @@ export async function decideLeave(input: unknown) {
 const onBehalfSchema = z
   .object({
     userId: z.string().min(1),
-    leaveType: z.enum(["CASUAL", "SICK", "EARNED", "UNPAID"]),
+    leaveType: z.enum(["CASUAL", "SICK", "EARNED", "UNPAID", "COMP_OFF"]),
     startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     reason: z.string().min(3, "Reason must be at least 3 characters"),
