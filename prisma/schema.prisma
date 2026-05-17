@@ -27,6 +27,7 @@ enum LeaveType {
   SICK
   EARNED
   UNPAID
+  COMP_OFF
 }
 
 enum LeaveStatus {
@@ -97,6 +98,9 @@ model User {
   leaveRequests    LeaveRequest[]    @relation("LeaveApplicant")
   approvedLeaves   LeaveRequest[]    @relation("LeaveApprover")
   payslips         Payslip[]
+  compOffCredits   CompOffCredit[]   @relation("CompOffOwner")
+  compOffGrants    CompOffCredit[]   @relation("CompOffGrantedBy")
+  compOffRevocations CompOffCredit[] @relation("CompOffRevokedBy")
 
   @@index([role])
   @@index([isActive])
@@ -205,6 +209,9 @@ model LeaveRequest {
   receiptUrl  String?
   receiptName String?
 
+  // For COMP_OFF requests: the credits this request consumed (FIFO at decide time).
+  compOffCredits CompOffCredit[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -276,4 +283,38 @@ model Holiday {
   id   String   @id @default(cuid())
   date DateTime @db.Date @unique
   name String
+}
+
+/// Comp-off credits earned by working a Sunday or a declared Holiday.
+/// One row per (user, day). Redemption links back to the LeaveRequest that
+/// consumed it — null until consumed; FIFO by `earnedOn` at decide time.
+model CompOffCredit {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation("CompOffOwner", fields: [userId], references: [id], onDelete: Cascade)
+  earnedOn       DateTime @db.Date
+  earnedFraction Float    @default(1.0) // 1.0 for PRESENT, 0.5 for HALF_DAY
+  expiresOn      DateTime @db.Date
+
+  // Audit: who/when. `grantedById` is null for attendance-trigger auto-grants.
+  grantedById    String?
+  grantedBy      User?    @relation("CompOffGrantedBy", fields: [grantedById], references: [id], onDelete: SetNull)
+
+  // Redemption link — null until consumed.
+  redeemedById     String?
+  redeemedBy       LeaveRequest? @relation(fields: [redeemedById], references: [id], onDelete: SetNull)
+  redeemedAt       DateTime?
+  redeemedFraction Float         @default(0)
+
+  // Revocation audit. A credit can be revoked iff it has not been redeemed.
+  revokedAt        DateTime?
+  revokedById      String?
+  revokedBy        User?         @relation("CompOffRevokedBy", fields: [revokedById], references: [id], onDelete: SetNull)
+  revocationReason String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, earnedOn])
+  @@index([userId, expiresOn])
+  @@index([userId, redeemedById])
 }
