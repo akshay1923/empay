@@ -209,6 +209,37 @@ export async function createLeaveOnBehalf(input: unknown) {
       };
     }
 
+    if (data.autoApprove && data.leaveType !== "UNPAID") {
+      const year = start.getUTCFullYear();
+      const allocation = await prisma.leaveAllocation.findUnique({
+        where: {
+          userId_leaveType_year: {
+            userId: data.userId,
+            leaveType: data.leaveType as LeaveType,
+            year,
+          },
+        },
+      });
+      const taken = await prisma.leaveRequest.aggregate({
+        where: {
+          userId: data.userId,
+          leaveType: data.leaveType as LeaveType,
+          status: "APPROVED",
+          startDate: { gte: new Date(Date.UTC(year, 0, 1)) },
+          endDate: { lt: new Date(Date.UTC(year + 1, 0, 1)) },
+        },
+        _sum: { totalDays: true },
+      });
+      const available =
+        (allocation?.totalDays ?? 0) - (taken._sum.totalDays ?? 0);
+      if (available < totalDays) {
+        return {
+          success: false as const,
+          error: `Insufficient ${data.leaveType} balance. Available ${available}, requested ${totalDays}.`,
+        };
+      }
+    }
+
     await prisma.leaveRequest.create({
       data: {
         userId: data.userId,
