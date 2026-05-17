@@ -1,10 +1,12 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useMemo, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import * as Dialog from "@radix-ui/react-dialog";
 import { Plus, X, AlertCircle } from "lucide-react";
 import { createLeaveOnBehalf } from "@/app/actions/admin-leave";
+import { LeaveImpactCard } from "@/components/leave/LeaveImpactCard";
+import { useLeavePreview } from "@/components/leave/useLeavePreview";
 import type { EmployeeOption } from "./types";
 
 type Form = {
@@ -33,6 +35,20 @@ export function NewLeaveDialog({ employees }: { employees: EmployeeOption[] }) {
   const [form, setForm] = useState<Form>(empty());
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
+
+  const previewInput = useMemo(
+    () =>
+      form.userId && form.startDate && form.endDate
+        ? {
+            userId: form.userId,
+            leaveType: form.leaveType,
+            startDate: form.startDate,
+            endDate: form.endDate,
+          }
+        : null,
+    [form.userId, form.leaveType, form.startDate, form.endDate]
+  );
+  const { preview, loading: previewLoading } = useLeavePreview(previewInput);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -171,6 +187,12 @@ export function NewLeaveDialog({ employees }: { employees: EmployeeOption[] }) {
                 />
               </Field>
             </div>
+
+            <LeaveImpactCard
+              preview={preview}
+              loading={previewLoading}
+              leaveType={form.leaveType}
+            />
 
             <Field label="Reason" required>
               <textarea

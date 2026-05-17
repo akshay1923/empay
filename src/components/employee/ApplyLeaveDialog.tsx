@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X, AlertCircle, Plane, Check, Paperclip, FileText } from "lucide-react";
 import { applyLeave } from "@/app/actions/leave";
+import { LeaveImpactCard } from "@/components/leave/LeaveImpactCard";
+import { useLeavePreview } from "@/components/leave/useLeavePreview";
 
 const LEAVE_TYPES = [
   { value: "CASUAL", label: "Casual leave" },
@@ -42,6 +44,19 @@ export function ApplyLeaveDialog({
   }, [open]);
 
   const requiresReceipt = leaveType === "SICK";
+
+  const previewInput = useMemo(
+    () =>
+      range
+        ? {
+            leaveType,
+            startDate: range.start,
+            endDate: range.end,
+          }
+        : null,
+    [range, leaveType]
+  );
+  const { preview, loading: previewLoading } = useLeavePreview(previewInput);
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -146,6 +161,12 @@ export function ApplyLeaveDialog({
                 ))}
               </select>
             </label>
+
+            <LeaveImpactCard
+              preview={preview}
+              loading={previewLoading}
+              leaveType={leaveType}
+            />
 
             <label className="block">
               <span
