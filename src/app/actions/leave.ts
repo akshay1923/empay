@@ -9,6 +9,14 @@ import { randomUUID } from "crypto";
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { LeaveStatus, LeaveType } from "@prisma/client";
+import { aggregateAttendanceForPeriod } from "@/lib/payroll/aggregate-period";
+import { type PayrollOutput } from "@/lib/payroll/calculate";
+import {
+  computeLeaveImpact,
+  type SalaryInputs,
+} from "@/lib/payroll/leave-preview";
+import { decryptInt } from "@/lib/crypto/payroll";
+import { can } from "@/lib/auth/permissions";
 
 function countLeaveDays(start: Date, end: Date): number {
   return eachDayOfInterval({ start, end }).filter((d) => !isSunday(d)).length;
@@ -164,6 +172,273 @@ export async function cancelLeave(leaveId: string) {
       error: e instanceof Error ? e.message : "Unknown error",
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Live payslip-impact preview for the leave-application form.
+// ---------------------------------------------------------------------------
+
+const previewSchema = z
+  .object({
+    userId: z.string().min(1).optional(),
+    leaveType: z.enum(["CASUAL", "SICK", "EARNED", "UNPAID"]),
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  })
+  .refine((d) => new Date(d.startDate) <= new Date(d.endDate), {
+    message: "End date must be on or after start date",
+    path: ["endDate"],
+  });
+
+export type PreviewMoney = {
+  daysPayable: number;
+  basic: number;
+  hra: number;
+  specialAllowance: number;
+  grossEarned: number;
+  employeePf: number;
+  professionalTax: number;
+  totalDeductions: number;
+  netPay: number;
+};
+
+export type PreviewBalance = {
+  leaveType: LeaveType;
+  year: number;
+  allocated: number;
+  used: number;
+  available: number;
+  projectedUsed: number;
+  projectedAvailable: number;
+};
+
+export type LeaveImpactPreview =
+  | { success: false; error: string }
+  | {
+      success: true;
+      month: number;
+      year: number;
+      requestedTotalDays: number;
+      requestedDaysInMonth: number;
+      multiMonth: boolean;
+      before: PreviewMoney;
+      after: PreviewMoney;
+      delta: {
+        daysPayable: number;
+        grossEarned: number;
+        employeePf: number;
+        netPay: number;
+      };
+      balance: PreviewBalance | null;
+      exceedsBalance: boolean;
+      unpaidFallback: {
+        after: PreviewMoney;
+        delta: {
+          daysPayable: number;
+          grossEarned: number;
+          employeePf: number;
+          netPay: number;
+        };
+      } | null;
+    };
+
+function toPreviewMoney(out: PayrollOutput): PreviewMoney {
+  return {
+    daysPayable: out.daysPayable,
+    basic: out.basic,
+    hra: out.hra,
+    specialAllowance: out.specialAllowance,
+    grossEarned: out.grossEarned,
+    employeePf: out.employeePf,
+    professionalTax: out.professionalTax,
+    totalDeductions: out.totalDeductions,
+    netPay: out.netPay,
+  };
+}
+
+/**
+ * Counts how many days inside [start, end] fall in `month`/`year` and are not
+ * Sundays. This is the number of days the prospective leave would affect the
+ * payroll *for that month*. Multi-month leaves are explicitly out of scope —
+ * we just preview the impact on the start-month payslip.
+ */
+function countLeaveDaysInMonth(
+  start: Date,
+  end: Date,
+  month: number,
+  year: number
+): number {
+  let n = 0;
+  for (const d of eachDayOfInterval({ start, end })) {
+    if (isSunday(d)) continue;
+    if (d.getUTCMonth() + 1 === month && d.getUTCFullYear() === year) {
+      n++;
+    }
+  }
+  return n;
+}
+
+export async function previewLeaveImpact(
+  input: unknown
+): Promise<LeaveImpactPreview> {
+  const session = await auth();
+  if (!session) return { success: false, error: "Unauthorized" };
+
+  let parsed: z.infer<typeof previewSchema>;
+  try {
+    parsed = previewSchema.parse(input);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return { success: false, error: e.issues[0]?.message ?? "Invalid input" };
+    }
+    return { success: false, error: "Invalid input" };
+  }
+
+  // Default the target to the calling user — for the on-behalf form, callers
+  // pass an explicit userId and need leave_request:create on top.
+  const targetUserId = parsed.userId ?? session.user.id;
+  if (targetUserId !== session.user.id) {
+    if (!can(session.user.role, "leave_request", "create")) {
+      return { success: false, error: "Forbidden" };
+    }
+  }
+
+  // Parse dates as UTC midnight so month boundary math matches the schema's
+  // date-only columns and the rest of the codebase.
+  const start = new Date(parsed.startDate + "T00:00:00.000Z");
+  const end = new Date(parsed.endDate + "T00:00:00.000Z");
+
+  const month = start.getUTCMonth() + 1;
+  const year = start.getUTCFullYear();
+  const multiMonth =
+    end.getUTCMonth() + 1 !== month || end.getUTCFullYear() !== year;
+
+  const requestedTotalDays = countLeaveDays(start, end);
+  const requestedDaysInMonth = countLeaveDaysInMonth(start, end, month, year);
+
+  // Active salary structure.
+  const struct = await prisma.salaryStructure.findFirst({
+    where: { userId: targetUserId, effectiveTo: null },
+    orderBy: { effectiveFrom: "desc" },
+  });
+  if (!struct) {
+    return { success: false, error: "No active salary structure" };
+  }
+  let ctcAnnual: number;
+  try {
+    ctcAnnual = decryptInt(struct.ctcAnnual);
+  } catch {
+    return { success: false, error: "Could not read salary structure" };
+  }
+
+  // Current month's stats (already accounts for approved leaves + attendance).
+  const att = await aggregateAttendanceForPeriod(targetUserId, month, year);
+
+  const salary: SalaryInputs = {
+    ctcAnnual,
+    basicPercent: struct.basicPercent,
+    hraPercent: struct.hraPercent,
+    pfEmployeePercent: struct.pfEmployeePercent,
+    pfEmployerPercent: struct.pfEmployerPercent,
+    professionalTax: struct.professionalTax,
+  };
+
+  const { before, after } = computeLeaveImpact(salary, att, {
+    kind: parsed.leaveType === "UNPAID" ? "unpaid" : "paid",
+    daysInMonth: requestedDaysInMonth,
+  });
+
+  // Leave-balance projection (only meaningful for paid types).
+  let balance: PreviewBalance | null = null;
+  let exceedsBalance = false;
+  if (parsed.leaveType !== "UNPAID") {
+    const startOfYear = new Date(Date.UTC(year, 0, 1));
+    const startOfNextYear = new Date(Date.UTC(year + 1, 0, 1));
+    const [allocation, takenAgg] = await Promise.all([
+      prisma.leaveAllocation.findUnique({
+        where: {
+          userId_leaveType_year: {
+            userId: targetUserId,
+            leaveType: parsed.leaveType as LeaveType,
+            year,
+          },
+        },
+      }),
+      prisma.leaveRequest.aggregate({
+        where: {
+          userId: targetUserId,
+          leaveType: parsed.leaveType as LeaveType,
+          status: "APPROVED",
+          startDate: { gte: startOfYear },
+          endDate: { lt: startOfNextYear },
+        },
+        _sum: { totalDays: true },
+      }),
+    ]);
+    const allocated = allocation?.totalDays ?? 0;
+    const used = takenAgg._sum.totalDays ?? 0;
+    const available = allocated - used;
+    const projectedUsed = used + requestedTotalDays;
+    const projectedAvailable = allocated - projectedUsed;
+    exceedsBalance = projectedAvailable < 0;
+    balance = {
+      leaveType: parsed.leaveType as LeaveType,
+      year,
+      allocated,
+      used,
+      available,
+      projectedUsed,
+      projectedAvailable,
+    };
+  }
+
+  // If a paid leave would exceed the available balance, compute the cost of
+  // the same range as UNPAID so the card can suggest the fallback with a
+  // real number rather than a hand-wave.
+  let fallback: {
+    after: PreviewMoney;
+    delta: {
+      daysPayable: number;
+      grossEarned: number;
+      employeePf: number;
+      netPay: number;
+    };
+  } | null = null;
+  if (parsed.leaveType !== "UNPAID" && exceedsBalance) {
+    const { after: fallbackAfter } = computeLeaveImpact(salary, att, {
+      kind: "unpaid",
+      daysInMonth: requestedDaysInMonth,
+    });
+    fallback = {
+      after: toPreviewMoney(fallbackAfter),
+      delta: {
+        daysPayable: fallbackAfter.daysPayable - before.daysPayable,
+        grossEarned: fallbackAfter.grossEarned - before.grossEarned,
+        employeePf: fallbackAfter.employeePf - before.employeePf,
+        netPay: fallbackAfter.netPay - before.netPay,
+      },
+    };
+  }
+
+  return {
+    success: true,
+    month,
+    year,
+    requestedTotalDays,
+    requestedDaysInMonth,
+    multiMonth,
+    before: toPreviewMoney(before),
+    after: toPreviewMoney(after),
+    delta: {
+      daysPayable: after.daysPayable - before.daysPayable,
+      grossEarned: after.grossEarned - before.grossEarned,
+      employeePf: after.employeePf - before.employeePf,
+      netPay: after.netPay - before.netPay,
+    },
+    balance,
+    exceedsBalance,
+    unpaidFallback: fallback,
+  };
 }
 
 export async function getMyLeaveBalance(year: number) {
